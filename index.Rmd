@@ -1,0 +1,405 @@
+---
+title: "Bayesian Spatial Regression"
+author: "Katie Jolly"
+date: "4/18/2019"
+output: 
+  prettydoc::html_pretty:
+    theme: leonids
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+# Introduction
+
+In 2015, there was a measles outbreak in California that originated in the Disneyland amusement park. Epidemiologists and other experts agree that low vaccination rates among some groups of children allowed the highly contagious disease to spread quickly and widely. During that outbreak, the disease spread to seven states and two countries.
+
+<br>
+
+Herd immunity happens when enough people in a population are vaccinated that a disease won't spread to people who can't get vaccinated for some reason. In order to establish herd immunity for measles, between 96 and 99 percent of the population must be vaccinated. Of people exposed to the disease, experts claim that it's more likely that only 50 to 86 percent were properly vaccinated, far lower than herd immunity. Based on those numbers, many epidemiologists are surprised we don't see more outbreaks.
+
+At the time of the outbreak, parents could claim "personal belief exemptions" (PBE) for not vaccinating their children. Typically, vaccines are required for entrance into schools. These PBEs provide a loophole for parents who are "more scared of the [measles, mumps, rubella] vaccine than they are of the measles." 
+
+With the rise of the anti-vaxx movement, we are interested in what demographic factors might be connected or at higher risk. Previous research has shows that white, wealtier communities as well as certain immigrant communities are the most at-risk. I also acknowledge the spatial aspect of this data, making a spatial model more suitable.
+
+My school level immunization data comes from the California Department of Health and is aggregated over the 2012-3013, 2013-2014, and 2014-2015 school years to smooth out some of the more unstable rates. My demographic data is Census data collected at the zip code level. I use this data because it is the most reliable and standard. In order to connect these two datasets, I will do a spatial join to figure out which schools are in which zip codes.
+
+<br>
+<br>
+
+```{r}
+library(rjags)
+library(tidyverse)
+library(sf)
+library(extrafont)
+library(leaflet)
+library(CARBayes)
+library(spdep)
+```
+
+
+```{r include = FALSE}
+
+options(scipen = 99)
+load("04_spatial_joins_zcta.RData")
+
+
+demographic_and_pbe_data_clean <- demographic_and_pbe_data_zcta %>%
+  dplyr::select(-c(57:61, 63)) %>%
+  dplyr::select(-58) %>%
+  st_transform(26911) %>%
+  mutate_at(vars(c(2, 4:28)), funs(as.numeric)) %>%
+  mutate(percent_white = ifelse(is.nan(percent_white), NA, percent_white),
+         weighted_mean_pbe_rate_zcta = ifelse(is.nan(weighted_mean_pbe_rate_zcta), NA, weighted_mean_pbe_rate_zcta),
+         log_weighted_mean_pbe_rate_zcta = log(weighted_mean_pbe_rate_zcta + 0.001))
+
+st_queen <- function(a, b = a) st_relate(a, b, pattern = "F***T****")
+
+demo_pbe_clean <- demographic_and_pbe_data_clean %>% filter(st_geometry_type(.) != "GEOMETRYCOLLECTION") %>%
+  st_cast("MULTIPOLYGON")  %>%
+  mutate(pbe_rate_clean = replace_na(weighted_mean_pbe_rate_zcta, 0))%>%
+  mutate(NB_QUEEN = st_queen(.))
+
+for(i in 1:nrow(demo_pbe_clean)){
+  demo_pbe_clean$nb_length[i] <- length(demo_pbe_clean$NB_QUEEN[[i]])
+}
+
+demo_pbe_clean <- demo_pbe_clean %>%
+  dplyr::select(-NB_QUEEN) %>%
+  filter(nb_length > 0) %>%
+  mutate(percent_white_100 = ifelse(!is.na(percent_white), percent_white * 100, 0),
+         hh_med_income_thousands = ifelse(!is.na(estimate_hh_med_income), (estimate_hh_med_income / 1000), 0),
+         enroll_tot_clean = replace_na(enroll_tot_zcta, 0),
+         pbe_tot_clean = replace_na(pbe_tot_zcta, 0)) 
+
+
+
+pbe_sp <- as(demo_pbe_clean, "Spatial")
+
+# create  Queens contiguity matrix
+spatmatrix <- poly2nb(pbe_sp)
+
+# create a neighbours list with spatial weights
+listw <- nb2listw(spatmatrix)
+
+outline <- tigris::states() %>%
+  st_as_sf() %>%
+  filter(NAME == "California") %>%
+  st_transform(26911)
+
+```
+
+**School level data on vaccination rates**
+
+| Variable name | Description                                                                |
+|---------------|----------------------------------------------------------------------------|
+| street        | Street address of school                                                   |
+| city          | City of school                                                             |
+| zip           | 9-digit zip code of school                                                 |
+| county_1      | County of school                                                           |
+| public_priv   | Type of school (public or private)                                         |
+| school_name   | Name of school                                                             |
+| lat_dec       | Latitude                                                                   |
+| lon_dec       | Longitude                                                                  |
+| enroll_tot    | Total enrollment over 2012-2013,  2013-2014, and 2014-2015                 |
+| pbe_tot       | Total personal belief exemptions  over 2012-2013, 2013-2014, and 2014-2015 |
+| pbe_rate      | Total PBEs divided by total enrollment                                     |
+
+<br> 
+<br>
+
+**Census zcta level demographic data**
+
+| Variable name                  | Description                                                                                                |
+|--------------------------------|------------------------------------------------------------------------------------------------------------|
+| geoid                          | Unique identifier                                                                                          |
+| estimate_total_pop             | Estimated total population in 2015                                                                         |
+| name                           | Name of census zcta                                                                                       |
+| estimate_hh_med_income         | Estimate of the household median income in 2015                                                            |
+| estimate_median_age_total      | Estimate of the median age in 2015                                                                         |
+| percent_white    | Percent of the population that identifies only as white in 2015                                           |
+
+<br>
+
+Below is a map of the overall personal belief exemption rate in each zip code. There are quite a few NA values because there aren't schools that report data in each zip code. 
+
+<br>
+
+```{r echo = FALSE}
+
+map_theme <- theme_minimal() + theme(text = element_text(color = "#60717a"), panel.grid = element_line("transparent"), axis.text = element_blank()) 
+map_colors <- scale_fill_gradientn(colors = c("#FFBD71", "#FCA464", "#F87D7B", "#D04A73"), na.value = "#e1e5e8")
+
+ggplot() +
+  geom_sf(data = outline, fill = NA, color = "gray60") +
+  geom_sf(data = demo_pbe_clean, aes(fill = pbe_tot_clean / enroll_tot_clean), color = NA) +
+  map_theme +
+  map_colors +
+  labs(title = "Personal belief exemptions in California, 2015", fill = "PBE rate")
+  
+
+```
+
+I will also map the important covariates that will be used in the model.
+
+```{r echo = FALSE}
+ggplot() +
+  geom_sf(data = outline, fill = NA, color = "gray60") +
+  geom_sf(data = demo_pbe_clean, aes(fill = hh_med_income_thousands), color = NA) +
+  map_theme +
+  map_colors +
+  labs(title = "Median income per zip code, 2015", fill = "Median income,\nin thousands")
+
+ggplot(demo_pbe_clean, aes(x = hh_med_income_thousands)) +
+  geom_density(fill = "deeppink") +
+  theme_minimal() + theme(text = element_text(color = "#60717a")) +
+  labs(title = "Distribution of median incomes", x = "Median income, in thousands", y = "")
+```
+
+From this plot we can see that the most common median income values are around \$50,000, with values ranging from \$0 to $250,000. 
+
+```{r echo = FALSE}
+ggplot() +
+  geom_sf(data = outline, fill = NA, color = "gray60") +
+  geom_sf(data = demo_pbe_clean, aes(fill = percent_white_100), color = NA) +
+  map_theme +
+  map_colors +
+  labs(title = "Percent white per zip code, 2015", fill = "Percent white population")
+
+ggplot(demo_pbe_clean, aes(x = percent_white_100)) +
+  geom_density(fill = "deeppink") +
+  theme_minimal() + theme(text = element_text(color = "#60717a")) +
+  labs(title = "Distribution of percent white per zip code", x = "Percent white population", y = "")
+```
+
+Most of the zip codes in California have a fairly high white population (> 75%), but there seems to be spatial clustering in the non-white populations. Those are likely immigrant and/or ethnic communities.
+
+
+```{r echo = FALSE}
+ggplot() +
+  geom_sf(data = outline, fill = NA, color = "gray60") +
+  geom_sf(data = demo_pbe_clean, aes(fill = estimate_median_age_total), color = NA) +
+  map_theme +
+  map_colors +
+  labs(title = "Median age per zip code, 2015", fill = "Median age")
+
+ggplot(demo_pbe_clean, aes(x = estimate_median_age_total)) +
+  geom_density(fill = "deeppink") +
+  theme_minimal() + theme(text = element_text(color = "#60717a")) +
+  labs(title = "Distribution of median ages per zip code", x = "Median age", y = "")
+```
+
+Here I use median age as a proxy for areas with a lot of young children. Presumably, areas with lower median ages will have more children in them. Most of the zip codes seem to have median ages between 30 and 50. 
+
+<br>
+
+One of the limitations of this data is that in connecting census data with the school data, I assume that people attend school in the zip code in which they live, which is not always true. It's a safer assumption than census tracts in general, though. I chose zip codes over counties because counties provide insights that are "too aggregated" in my opinion. 
+
+## Methodology
+
+In order to test whether or not the added complexity from a spatial hierarchical model is necessary, we can test for spatial autocorrelation. This is essentially testing whether there is a significant spatial pattern in the data, otherwise generalized least squares models are sufficient. Moran's I is one way of testing this, where a positive I statistic indicates spatial clustering, as opposed to a random or dispersed distribution. We first set up a hypothesis: 
+
+$$H_0: \text{No spatial clustering, }\: I \leq 0\\
+H_1: \text{Spatial clustering present, }\: I > 0$$
+
+Next we can calculate and test our I statistic. I use the Monte Carlo testing framework, where random distributions of data across your given region are generated and compared to the observed distribution. This helps because some regions are just naturally going to look more clustered than others. 
+
+```{r}
+x = ifelse(demo_pbe_clean$enroll_tot_clean == 0, 0, demo_pbe_clean$pbe_tot_clean / demo_pbe_clean$enroll_tot_clean)
+moran.mc(x = x, listw, alternative = "greater", nsim = 999)
+```
+
+$$\text{Moran's I results:}\\
+I = 0.14674, \; p = 0.001 \\
+\text{Weak spatial clustering}$$
+
+Based on this hypothesis test, we can say that it is highly unlikely of seeing data this clustered if in fact there were a spatially random distribution. Now knowing that there is global clustering, there is also an analagous local autocorrelation test that finds hotspots. I've mapped those hotspots below in red. 
+
+```{r include = FALSE}
+# calculate the local moran of the distribution of white population
+lmoran <- localmoran(pbe_sp$pbe_rate_clean, listw, na.action = na.omit)
+summary(lmoran)
+
+# padronize the variable and save it to a new column
+pbe_sp$s_pbe <- scale(pbe_sp$pbe_rate_clean)  %>% as.vector()
+
+# create a spatially lagged variable and save it to a new column
+pbe_sp$lag_s_pbe <- lag.listw(listw, pbe_sp$s_pbe)
+
+# summary of variables, to inform the analysis
+summary(pbe_sp$s_pbe)
+summary(pbe_sp$lag_s_pbe)
+
+# create a new variable identifying the moran plot quadrant for each observation, dismissing the non-significant ones
+pbe_sp$quad_sig <- NA
+
+# high-high quadrant
+pbe_sp[(pbe_sp$s_pbe >= 0 & 
+                 pbe_sp$lag_s_pbe >= 0) & 
+                (lmoran[, 5] <= 0.05), "quad_sig"] <- "high-high"
+# low-low quadrant
+pbe_sp[(pbe_sp$s_pbe <= 0 & 
+                 pbe_sp$lag_s_pbe <= 0) & 
+                (lmoran[, 5] <= 0.05), "quad_sig"] <- "low-low"
+# high-low quadrant
+pbe_sp[(pbe_sp$s_pbe >= 0 & 
+                 pbe_sp$lag_s_pbe <= 0) & 
+                (lmoran[, 5] <= 0.05), "quad_sig"] <- "high-low"
+# low-high quadrant
+pbe_sp@data[(pbe_sp$s_pbe <= 0 
+               & pbe_sp$lag_s_pbe >= 0) & 
+                (lmoran[, 5] <= 0.05), "quad_sig"] <- "low-high"
+# non-significant observations
+pbe_sp@data[(lmoran[, 5] > 0.05), "quad_sig"] <- "not signif."  
+
+pbe_sp$quad_sig <- as.factor(pbe_sp$quad_sig)
+pbe_sp@data$id <- rownames(pbe_sp@data)
+
+# plotting the map
+df <- fortify(pbe_sp, region="id")
+df <- left_join(df, pbe_sp@data)
+```
+
+```{r echo = FALSE}
+
+lmoran_sf <- st_as_sf(pbe_sp) %>%
+  st_transform(4326)
+
+df %>% 
+  ggplot(aes(long, lat, group = group, fill = quad_sig)) + 
+  geom_polygon(color = "white", size = .05)  + coord_equal() + 
+  theme_void() +
+  theme(text = element_text(family = "Segoe UI Light")) + 
+  scale_fill_manual(values = c("#DD7373", "#D1d1d1"), name = "Cluster type") +
+  labs(title = "Local spatial autocorrelation in PBE rates")
+
+```
+
+The spatial models I'll be using are a class of Bayesian spatial hierarchical models. Broadly, they model some observed data based on covariates and some latent spatial structure. Most of these models try to approximate some sort of rate. Since one of the most common uses is epidemiology, these rates are often disease or mortality rates. I'll walk through the model structure below using disease rates as an example.
+
+For a region with $n$ non-overlapping polygons, in theory we know there are $E_i$ people at risk in polygon $i = 1, 2, ..., n$. We also then observe $y_i$ cases in polygon $i$. Based on previous research or understanding we can say there is some $\theta_i$ underlying true area-specific relative risk for contracting that disease. Then the conditional distribution of $y_i$, cases observed, given $\theta_i$, risk, is: 
+
+$$y_i|\theta_i \sim \text{Poisson}(E_i\theta_I)$$
+
+In other words the expected number of cases given the risk is the number of people at risk multiplied by the chance they actual get the disease. This is intuitively how we think about disease rates. But, we also know that modeling $\hat\theta_i$ as purely a ratio of the cases over the at-risk population is prone to instability when $E_i$ is small, or when the at-risk population is small. This is because $Var(\hat\theta_i) = \frac{\theta_i}{E_i}$. Instead we can use Bayesian spatial hierarchical frameworks to model $\hat\theta$ in a way that borrows strength from neighboring regions, thus not entirely relying on a small, finite population. 
+
+The general model structure looks like a random effects model:
+
+$$log(\hat\theta_i)=\mu+z_i^T\beta + b_i \\
+\mu = \text{overall risk level} \\
+z_i\beta_i = \text{vector of covariates & corresponding coefficient} \\
+b_i = \text{spatial random effect}$$
+
+When we define a prior distribution the default is often:
+
+$$\mu \sim N(0, \frac{1}{100^2}) \\
+\beta \sim N(0, \frac{1}{100^2}) \\
+b_i \sim \text{some spatial dependency model}$$
+
+There are a variety of different ways of modeling that spatial dependency. The one I will be focusing on is the Besag model, one of the simpler and more commonly used of the possible options. This model considers $b_i$ to be normally distributed with the mean being a function of the neighboring values, the set $\delta i$ and the variance proportional to the number of neighbors, $n_{\delta i}$. In notation, it looks like this:
+
+$$b_i|b_{-i}, \tau_b \sim N(\frac{1}{n_{\delta i}}\sum_{j \in \delta i}b_j, \frac{1}{n_{\delta i} \tau_b}) \\
+\tau_b = \text{precision parameter}\\
+b_{-i} = (b_1, ... b_{i-1}, b_{i+1},...,b_n)^T$$
+
+One way to make this model more complex is to assume $b$ follows a normal distribution with mean 0 and 
+
+$$Var(b|\tau_u, \phi) = \tau_b^{-1}((1 - \phi)I + \phi Q)^{-1}$$
+
+where $\phi \in [0,1]$ is a mixing parameter. This is called a Leroux model. If $\phi =1$, the model reduces to the Besag model.
+
+
+## Applying the model to vaccine data
+
+I have counts of the number of students who claim PBEs per zip code, so a Poisson model makes the most sense for that. However, I also want to normalize those values to account for zip codes that just have more or fewer students, so we would expect a smaller or larger number of PBEs. But, when I normalize I no longer have count data. Offset terms (where $\beta_\text{offset} = 1$) are useful for this. 
+
+If we were to model the PBE rate, the model would look like this:
+
+$$log \bigg(\frac{\text{PBE total}}{\text{Enroll total}}\bigg) = \mu + z_i^T\beta + b_i$$
+
+But if we want to just model PBE total, we can move the denominator to the other side using log properties.
+
+$$log(\text{PBE total}) = \mu + z_i^T\beta + b_i + \text{offset(Enroll total)}$$
+
+One way to check the model is to assess the spatial autocorrelation of the residuals. If the residuals are clustered, then there is likely some covariate not accounted for in the model. 
+
+# Modeling
+
+```{r include = FALSE}
+beta_samples <- read_csv("beta_samples.csv")
+load("residuals.RData")
+```
+
+
+```{r eval = FALSE}
+pbe_nb <- poly2nb(pbe_sp, row.names=rownames(pbe_sp))
+W <- nb2mat(pbe_nb, style="B", zero.policy=TRUE)
+```
+
+
+
+```{r eval = FALSE}
+model.spatial.poisson2 <- S.CARleroux(formula= pbe_tot_clean ~ percent_white_100 + hh_med_income_thousands + estimate_median_age_total + offset(log(enroll_tot_clean + 1)), data=pbe_sp@data, W=W, burnin=100000, n.sample=500000, thin=10, family = "poisson", rho = 1)
+```
+
+<br>
+
+Of the models I tried, I think the one that includes `percent_white_100`, `hh_med_income_thousands`, and `estimate_median_age_total` is the best representation of this data. Next we should check to make sure the residuals are not clustered.
+
+
+```{r}
+moran.mc(residuals, listw, nsim = 9999) # completely spatially random
+```
+
+And in fact we see that we cannot detect any spatial pattern in the residuals. 
+
+## Inference from samples
+
+```{r eval = FALSE}
+beta_samples <- tibble(intercept = model.spatial.poisson2$samples$beta[,1],
+                       percent_white_100 = model.spatial.poisson2$samples$beta[,2],
+                       med_income_1000s = model.spatial.poisson2$samples$beta[,3],
+                       median_age = model.spatial.poisson2$samples$beta[,4])
+```
+
+The coefficients in a poisson regression are "rate ratios." The exponentiated coefficients represent, holding other coefficients constant, the rate change from a one unit increase in the covariate. The credible intervals for the exponentiated coefficients are shown below.
+
+```{r include = FALSE}
+beta_samples %>%
+  summarise(quantile(exp(percent_white_100), 0.025), quantile(exp(percent_white_100), 0.975))
+beta_samples %>%
+  summarise(quantile(exp(med_income_1000s), 0.025), quantile(exp(med_income_1000s), 0.975))
+beta_samples %>%
+  summarise(quantile(exp(median_age), 0.025), quantile(exp(median_age), 0.975))
+```
+
+<br>
+
+|                       	| Low (2.5%) 	| High (97.5%) 	|
+|-----------------------	|------------	|--------------	|
+| Percent white         	| 1.01674	    | 1.020298     	|
+| Median income (1000s) 	| 1.008928   	| 1.012938     	|
+| Median age            	| 0.994244   	| 1.000732     	|
+
+<br>
+
+We can say for a one unit increase in percent white or median income, the PBE rate will also increase. The increase is very slight because of the large scale of the covariate data. That means that communities that are wealthier and  whiter are the most likely to have high personal belief exemption rates. The effect of median age does not seem to be significant based on this analysis.
+
+In further analysis I would include variables for the foreign-born population, educational attainment, and more specific age-group population variables. One of the benefits of this modeling framework is that it is a nice way of borrowing strength from the neighborhood for zip codes with small enrollment sizes and thus unstable rates. This means that large outliers will be pulled more towards the neighborhood pattern, but the coefficient estimates overall will be more interpretable. It's a nice middle-ground between complete pooling and no pooling. I would also like to try running this model at different areal units to test how robust our coefficient estimates are.
+
+In the future I also want to learn more about the extensions of the Besag model, such as dissimilarity (border) modeling and the Leroux model. 
+
+
+## Resources
+
+* [CARBayes version 5.1.1: An R package for spatial areal unit modelling with conditional autoregressive priors](https://cran.r-project.org/web/packages/CARBayes/vignettes/CARBayes.pdf)
+
+* [An intuitive Bayesian spatial model for disease mapping that accounts for scaling](https://arxiv.org/pdf/1601.01180.pdf?fbclid=IwAR07om-jZXQvfuSiQtRpOi5PWJ5IpjRG7SCeM7hMAC6rP0sEuTNtZaEwZOE)
+
+* [Mapping the Measles Outbreak](https://www.washingtonpost.com/graphics/2019/health/measles-who-is-being-affected/)
+
+* [Vaccine refusal helped fuel Disneyland measles outbreak, study says](https://www.latimes.com/science/sciencenow/la-sci-sn-disneyland-measles-under-vaccination-20150316-story.html)
+
+* [How stricter vaccine laws spared California from a major measles outbreak](https://www.latimes.com/projects/la-me-measles-us-california-outbreak-vaccine-new-york-disneyland/)
